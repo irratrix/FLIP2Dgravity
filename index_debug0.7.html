@@ -1,0 +1,1955 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Prueba Simulador FLIP con WebGL</title> <style>
+        body { margin: 20px; font-family: sans-serif; background-color: #e0e0e0; display: flex; flex-direction: column; align-items: center;}
+        canvas { display: block; border: 1px solid black; margin-bottom: 10px; /* Espacio entre canvases */ }
+        /* Puedes ajustar el fondo del canvas WebGL directamente en el clearColor de WebGL */
+        /* #simulationCanvasWebGL { background-color: #f0f8ff; } */ 
+        #heightGraphCanvas { background-color: #f8f8f8; } 
+        #pressureIterationsGraphCanvas { background-color: #f8f0e8; } 
+        #controls { margin-bottom: 10px; }
+        #particleCountGraphCanvas { background-color: #e8f8f0; } /* Un color de fondo diferente */
+
+    </style>
+</head>
+<body>
+    <h1>Prueba del Simulador FLIP con WebGL</h1> 
+    <div id="controls">
+        <button id="startButton">Iniciar/Pausar</button>
+        <button id="resetButton">Reiniciar</button>
+        <button id="softResetButton">Reiniciar a Inicio Configurado</button>
+        <br> <label for="domainWidthInput">Ancho Dominio (m):</label>
+        <input type="number" id="domainWidthInput" value="2.0" step="0.1" style="width: 60px;">
+        <label for="domainHeightInput">Alto Dominio (m):</label>
+        <input type="number" id="domainHeightInput" value="1.0" step="0.1" style="width: 60px;">
+        <br> <label for="dtInput">dt (s):</label>
+        <input type="number" id="dtInput" value="0.016" step="0.001" style="width: 60px;">
+        <label for="resInput">Resolución Celda (m):</label>
+        <input type="number" id="resInput" value="0.02" step="0.005" style="width: 60px;">
+        <label for="iterInput">Iter. Presión:</label>
+        <input type="number" id="iterInput" value="400" step="1" style="width: 50px;">
+        <label for="brushSizeInput">Grosor Pincel:</label>
+        <input type="number" id="brushSizeInput" value="1" min="1" max="5" style="width: 40px;">
+    </div>
+    <div id="stats" style="margin-bottom: 10px; font-family: monospace;">
+    <span>Tiempo de Simulación: <span id="simTimeDisplay">0.00</span> s</span> | 
+    <span>FPS: <span id="fpsDisplay">--</span></span>
+    </div>
+
+    <canvas id="simulationCanvasWebGL"></canvas> 
+    <canvas id="heightGraphCanvas"></canvas>
+    <canvas id="pressureIterationsGraphCanvas"></canvas>
+    <canvas id="particleCountGraphCanvas"></canvas> ```
+
+    <script src="wrappedgl.js"></script> 
+    <script src="flipSimulator0.7_debug.js"></script>
+    <script>
+        // const simCanvas = document.getElementById('simulationCanvas'); // Ya no usamos este para simulación principal
+        // const simCtx = simCanvas.getContext('2d');                  // Ya no usamos este para simulación principal
+        
+        // NUEVO: Canvas para WebGL
+        const webglCanvas = document.getElementById('simulationCanvasWebGL');
+        let wgl; // Se inicializará en setupSimulator
+
+        let isPaintingSolids = false; // Rastrear si se está pintando
+        let brushSize = 1; // 1 significa una sola celda (1x1), 2 podría ser 3x3, 3 podría ser 5x5, etc. (radio)
+                        // O podemos interpretarlo como el número de celdas de lado. Empecemos con radio.
+        let lastPaintedCell = { i: -1, j: -1 }; // Para guardar la última celda pintada
+        let currentPaintMode = 'paint'; // Puede ser 'paint' o 'erase'
+
+        let isAddingParticles = false;
+        let lastProcessedCellForParticleLine = { i: -1, j: -1 }; // Celda previa en el arrastre de partículas
+        let cellParticleAddTimestamps = new Map();      // Almacena: "i-j" -> timestamp de la última adición POR RATÓN
+        const PARTICLE_ADD_INTERVAL_MS = 16;         // Intervalo para re-añadir si se mantiene pulsado
+        let cellsFilledInCurrentStroke = new Set();   // Celdas ya llenadas en el TRAZO DE ARRASTRE ACTUAL de partículas
+        let particleAddIntervalId = null;             // ID para el setInterval de "mantener pulsado"
+        let activeParticleSources = []; // Array para los emisores activos
+
+        let isManagingEmitters = false;                 // Flag: ¿estamos actualmente activando/desactivando emisores con Shift?
+        let currentEmitterToggleMode = 'create';      // 'create' o 'erase' para el gesto actual de Shift+Drag
+        let uiEmitterLastAddTime = new Map();         // Almacena: "i-j" -> timestamp de la última vez que este emisor de UI añadió partículas
+
+        const graphCanvas = document.getElementById('heightGraphCanvas');
+        const graphCtx = graphCanvas.getContext('2d');
+        const iterGraphCanvas = document.getElementById('pressureIterationsGraphCanvas');
+        const iterGraphCtx = iterGraphCanvas.getContext('2d');
+
+        let simulator;
+        let animationFrameId;
+        let isRunning = false;
+        
+        // Variables de WebGL que se inicializarán
+        let particleShaderProgram;
+        let particleBuffer;
+        let solidCellBuffer;
+        let solidCellShaderProgram;
+        let projectionMatrix;
+        // const particleRadiusPixels = 2; // Para WebGL usaremos gl_PointSize
+
+        const UI_EMITTER_DEFAULT_VX = 0.0;  // Velocidad X inicial para partículas de emisores de UI
+        const UI_EMITTER_DEFAULT_VY = 0.0;  // Velocidad Y inicial (ej. un pequeño empuje hacia arriba)
+
+        let pixelsPerMeter; 
+        // let lastTime = 0;
+        let previousFrameTimestamp = 0;
+        let frameCountForFPS = 0;
+        let timeAccumulatorForFPS = 0.0;
+        const fpsUpdateInterval = 0.5; // Actualizar el display de FPS cada 0.5 segundos
+
+        const particleCountGraphCanvas = document.getElementById('particleCountGraphCanvas');
+        const particleCountGraphCtx = particleCountGraphCanvas.getContext('2d');
+        //let theoreticalParticleCount = 0;
+        //let theoreticalParticleCountHistoryData = []; // Historial para el conteo teórico
+
+        const MAX_CANVAS_DISPLAY_WIDTH_PX = 800;  // Ancho máximo deseado para el canvas en píxeles
+        const MAX_CANVAS_DISPLAY_HEIGHT_PX = 600; // Alto máximo deseado para el canvas en píxeles
+
+        let initialSolidGridState = null;
+        let initialEmitterGridState = null;
+        let initialParticlesState = null;
+
+        // --- NUEVO: Código de Shaders (GLSL) ---
+        const particleVertexShaderSource = `
+            precision highp float;
+
+            attribute vec2 a_particlePosition; // Posición en metros
+            attribute vec2 a_particleVelocity; // Velocidad para colorear (opcional)
+            
+            uniform mat4 u_projectionMatrix;
+            uniform float u_pointSize;
+            
+            varying vec2 v_velocity;
+
+            void main() {
+                gl_Position = u_projectionMatrix * vec4(a_particlePosition, 0.0, 1.0);
+                gl_PointSize = u_pointSize;
+                v_velocity = a_particleVelocity;
+            }
+        `;
+
+        const particleFragmentShaderSource = `
+            precision highp float;
+
+            // uniform vec4 u_particleColor; // Si quieres un color fijo desde JS
+            varying vec2 v_velocity;
+            uniform float u_particleAlpha; // NUEVO: Uniform para controlar la opacidad
+
+            void main() {
+                // Opción 1: Punto circular básico
+                vec2 coord = gl_PointCoord - vec2(0.5);
+                if (length(coord) > 0.5) {
+                    discard;
+                }
+                // gl_FragColor = u_particleColor; // Para color fijo
+
+                // Opción 2: Colorear por velocidad
+                float speed = length(v_velocity);
+                float normalizedSpeed = clamp(speed / 3.0, 0.0, 1.0); // Asume vel máx de 5m/s para ejemplo
+                gl_FragColor = mix(vec4(0.0, 0.2, 0.8, 1.0), vec4(0.8, 0.2, 0.0, 1.0), normalizedSpeed); // Azul a Naranja/Rojo
+                vec4 color_variable_temporal = mix(vec4(0.0, 0.2, 0.8, 1.0), vec4(0.25, 0.91, 1.0, 1.0), normalizedSpeed); // <--- CAMBIADO TEMPORALMENTE EL NOMBRE
+                gl_FragColor = vec4(color_variable_temporal.rgb, u_particleAlpha); // <--- USAR EL NUEVO NOMBRE
+
+            }
+        `;
+
+        const solidCellVertexShaderSource = `
+            precision highp float;
+            attribute vec2 a_cellPosition; 
+            uniform mat4 u_projectionMatrix;
+            void main() {
+                gl_Position = u_projectionMatrix * vec4(a_cellPosition, 0.0, 1.0);
+            }
+        `;
+
+        const solidCellFragmentShaderSource = `
+            precision highp float;
+            uniform vec4 u_solidColor;
+            void main() {
+                gl_FragColor = u_solidColor;
+            }
+        `;
+
+        // --- NUEVO: Función para crear matriz ortográfica ---
+        function createOrthographicMatrix(left, right, bottom, top, near, far) {
+            const lr = 1 / (left - right);
+            const bt = 1 / (bottom - top);
+            const nf = 1 / (near - far);
+            const mat = new Float32Array(16); // WebGL usa Float32Array para matrices
+
+            mat[0] = -2 * lr; mat[1] = 0; mat[2] = 0; mat[3] = 0;
+            mat[4] = 0; mat[5] = -2 * bt; mat[6] = 0; mat[7] = 0;
+            mat[8] = 0; mat[9] = 0; mat[10] = 2 * nf; mat[11] = 0;
+            mat[12] = (left + right) * lr;
+            mat[13] = (top + bottom) * bt;
+            mat[14] = (far + near) * nf;
+            mat[15] = 1;
+            return mat;
+        }
+
+        /*
+        function paintSolidCell(event) {
+            if (!webglCanvas || !simulator || !pixelsPerMeter) return; // pixelsPerMeter debe estar definido
+
+            const rect = webglCanvas.getBoundingClientRect();
+            const mouseX_canvas = event.clientX - rect.left;
+            const mouseY_canvas = event.clientY - rect.top;
+
+            // Convertir coordenadas del canvas (píxeles) a coordenadas del mundo (metros)
+            const mouseX_world = mouseX_canvas / pixelsPerMeter;
+            const mouseY_world = (webglCanvas.height - mouseY_canvas) / pixelsPerMeter; // Invertir Y
+
+            // Convertir coordenadas del mundo a índices de celda (i, j)
+            const h = simulator.grid.cellSize;
+            const i = Math.floor(mouseX_world / h);
+            const j = Math.floor(mouseY_world / h);
+
+            const nx = simulator.grid.nx;
+            const ny = simulator.grid.ny;
+
+            // Verificar que la celda está dentro de los límites de la rejilla
+            if (i >= 0 && i < nx && j >= 0 && j < ny) {
+                if (!simulator.grid.isSolid[i][j]) { // Pintar solo si no era ya sólida (evita trabajo extra)
+                    simulator.grid.isSolid[i][j] = 1;
+                    simulator.grid.isFluid[i][j] = 0; // Importante: una celda sólida no es fluida
+
+                    // Opcional: Eliminar partículas que estén en la celda recién pintada como sólida
+                    removeParticlesFromCell(i, j);
+
+                    // Volver a dibujar la escena para mostrar el cambio inmediatamente
+                    // Esto asume que drawSceneWebGL() puede ser llamada en cualquier momento
+                    // y redibuja todo basándose en el estado actual del simulador.
+                    if (!isRunning) { // Solo redibujar si no estamos en medio del gameLoop principal
+                        drawSceneWebGL();
+                    }
+                }
+            }
+        }
+*/
+
+        function clearParticlesInCell_UI(ci, cj) {
+            if (!simulator) return;
+            const h = simulator.grid.cellSize;
+            const cellMinX = ci * h;
+            const cellMaxX = (ci + 1) * h;
+            const cellMinY = cj * h;
+            const cellMaxY = (cj + 1) * h;
+            simulator.particles = simulator.particles.filter(p => {
+                return !(p.x >= cellMinX && p.x < cellMaxX && 
+                            p.y >= cellMinY && p.y < cellMaxY);
+            });
+        }
+
+        function handleAddParticlesToCell_UI(ci, cj, isNewStrokeSegment) {
+            if (!simulator) return false;
+            if (ci < 0 || ci >= simulator.grid.nx || cj < 0 || cj >= simulator.grid.ny || simulator.grid.isSolid[ci][cj]) {
+                return false;
+            }
+
+            const cellKey = `<span class="math-inline">\{ci\}\-</span>{cj}`;
+            const currentTime = Date.now();
+            const lastUserAddTime = cellParticleAddTimestamps.get(cellKey) || 0;
+            let particlesWereAdded = false;
+
+            // Condición 1: ¿Es parte de un nuevo segmento de línea en el arrastre actual Y no se ha llenado ya en este arrastre?
+            // O Condición 2: ¿Ha pasado suficiente tiempo desde la última vez que se añadieron partículas a ESTA celda?
+            let allowAdd = false;
+            if (isNewStrokeSegment && !cellsFilledInCurrentStroke.has(cellKey)) {
+                allowAdd = true;
+            } else if ((currentTime - lastUserAddTime) >= PARTICLE_ADD_INTERVAL_MS) {
+                allowAdd = true;
+            }
+
+            if (allowAdd) {
+                if (!isRunning) { // Fase inicial: limpiar SIEMPRE antes de añadir
+                    clearParticlesInCell_UI(ci, cj);
+                }
+                // Durante la simulación (isRunning=true): NO se limpian las partículas existentes aquí.
+                // addParticlesInCell solo añade las N*N nuevas.
+
+                if (simulator.addParticlesInCell(ci, cj)) { // Llama al método del simulador que solo añade
+                    cellParticleAddTimestamps.set(cellKey, currentTime); // Actualizar timestamp para esta celda
+                    if (isNewStrokeSegment) { // Solo si es parte de la "pintada" de la línea
+                        cellsFilledInCurrentStroke.add(cellKey);
+                    }
+                    particlesWereAdded = true;
+                }
+            }
+
+            if (particlesWereAdded) {
+                drawSceneWebGL(); // Redibujar para feedback inmediato
+            }
+            return particlesWereAdded;
+        }
+
+        function attemptParticleAdd(ci, cj, isPartOfLineStroke) {
+            if (!simulator) return false;
+            // Validaciones básicas de celda (ya están en simulator.addParticlesInCell, pero una comprobación temprana aquí no hace daño)
+            if (ci < 0 || ci >= simulator.grid.nx || cj < 0 || cj >= simulator.grid.ny || simulator.grid.isSolid[ci][cj]) {
+                return false;
+            }
+
+            const cellKey = `<span class="math-inline">\{ci\}\-</span>{cj}`;
+            const currentTime = Date.now();
+            const lastUserAddTime = cellParticleAddTimestamps.get(cellKey) || 0;
+            let allowAdd = false;
+
+            if (isPartOfLineStroke) {
+                // Si es parte de un trazo de línea, y no se ha llenado en este trazo, permitir.
+                if (!cellsFilledInCurrentStroke.has(cellKey)) {
+                    allowAdd = true;
+                }
+            } else { // No es parte de un trazo de línea (ej. clic inicial, o temporizador de "mantener pulsado")
+                if ((currentTime - lastUserAddTime) >= PARTICLE_ADD_INTERVAL_MS) {
+                    allowAdd = true;
+                }
+            }
+
+            let particlesWereActuallyAdded = false;
+            if (allowAdd) {
+                // Pasamos la variable global 'isRunning' a addParticlesInCell
+                if (simulator.addParticlesInCell(ci, cj, isRunning)) {
+                    cellParticleAddTimestamps.set(cellKey, currentTime); // Actualizar timestamp para esta celda
+                    if (isPartOfLineStroke) { // Solo marcar para la lógica de línea si vino de ahí
+                        cellsFilledInCurrentStroke.add(cellKey);
+                    }
+                    particlesWereActuallyAdded = true;
+                }
+            }
+
+            if (particlesWereActuallyAdded) {
+                drawSceneWebGL(); // Redibujar para feedback inmediato
+            }
+            return particlesWereActuallyAdded;
+        }
+
+        function drawLineAndAddParticlesForStrokeUI(x0_cell, y0_cell, x1_cell, y1_cell) {
+            if (!simulator) return;
+            // ... (Lógica de Bresenham: dx, dy, sx, sy, err, e2, currentX, currentY) ...
+            let dx = Math.abs(x1_cell - x0_cell);
+            let dy = -Math.abs(y1_cell - y0_cell);
+            let sx = x0_cell < x1_cell ? 1 : -1;
+            let sy = y0_cell < y1_cell ? 1 : -1;
+            let err = dx + dy;
+            let e2;
+            let currentX = x0_cell;
+            let currentY = y0_cell;
+
+            while (true) {
+                // Para la línea, cada celda es un "nuevo toque" dentro del trazo actual (isPartOfActiveStroke = true)
+                attemptAndAddParticlesUI(currentX, currentY, true); 
+
+                if (currentX === x1_cell && currentY === y1_cell) break;
+                e2 = 2 * err;
+                let prevX = currentX; let prevY = currentY;
+                if (e2 >= dy) { err += dy; currentX += sx; }
+                if (e2 <= dx) { err += dx; currentY += sy; }
+                if (currentX === prevX && currentY === prevY && !(currentX === x1_cell && currentY === y1_cell)) break; 
+            }
+            // El redibujado se maneja dentro de attemptAndAddParticlesUI
+        }
+
+        function drawLineAndAddParticles_strokeBased(x0_cell, y0_cell, x1_cell, y1_cell) {
+            if (!simulator) return;
+            let dx = Math.abs(x1_cell - x0_cell);
+            let dy = -Math.abs(y1_cell - y0_cell);
+            let sx = x0_cell < x1_cell ? 1 : -1;
+            let sy = y0_cell < y1_cell ? 1 : -1;
+            let err = dx + dy;
+            let e2;
+            let currentX = x0_cell;
+            let currentY = y0_cell;
+
+            while (true) {
+                // Para la línea, cada celda es un "nuevo toque" dentro del trazo actual (isPartOfActiveStroke = true)
+                attemptAndAddParticlesUI(currentX, currentY, true); 
+
+                if (currentX === x1_cell && currentY === y1_cell) break;
+                e2 = 2 * err;
+                let prevX = currentX; let prevY = currentY; // Para el safety break
+                if (e2 >= dy) { err += dy; currentX += sx; }
+                if (e2 <= dx) { err += dx; currentY += sy; }
+                if (currentX === prevX && currentY === prevY && !(currentX === x1_cell && currentY === y1_cell)) break; 
+            }
+            // El redibujado se maneja dentro de attemptAndAddParticlesUI
+        }
+
+        function attemptAndAddParticlesUI(ci, cj, isPartOfActiveStroke) {
+            if (!simulator) return false;
+            if (ci < 0 || ci >= simulator.grid.nx || cj < 0 || cj >= simulator.grid.ny || simulator.grid.isSolid[ci][cj]) {
+                return false;
+            }
+
+            const cellKey = `${ci}-${cj}`;
+            const currentTime = Date.now();
+            let allowAdd = false;
+
+            if (isPartOfActiveStroke) {
+                // Si es parte de un trazo de línea activo, añadir SOLO SI no se ha llenado en ESTE trazo.
+                // Esto es para la "pintada instantánea" de la línea.
+                if (!cellsFilledInCurrentStroke.has(cellKey)) {
+                    allowAdd = true;
+                }
+            } else { // No es parte de un trazo de línea (es un clic inicial o el temporizador de "mantener pulsado")
+                const lastUserAddTime = cellParticleAddTimestamps.get(cellKey) || 0;
+                if ((currentTime - lastUserAddTime) >= PARTICLE_ADD_INTERVAL_MS) {
+                    allowAdd = true; // Permitir si ha pasado el intervalo de tiempo para esta celda
+                }
+            }
+
+            let particlesWereActuallyAdded = false;
+            if (allowAdd) {
+                // Llamamos a addParticlesInCell del simulador, pasando el estado 'isRunning'
+                // Este método ya gestiona si se borran o no las partículas existentes según isRunning.
+                if (simulator.addParticlesInCell(ci, cj, isRunning)) { // isRunning es la variable global de UI
+                    cellParticleAddTimestamps.set(cellKey, currentTime); // Actualizar SIEMPRE el timestamp de la última adición exitosa
+                    
+                    if (isPartOfActiveStroke) { // Solo si fue parte del trazo de línea, marcarla en el Set del trazo actual
+                        cellsFilledInCurrentStroke.add(cellKey);
+                    }
+                    particlesWereActuallyAdded = true;
+                }
+            }
+
+            if (particlesWereActuallyAdded) {
+                drawSceneWebGL(); // Redibujar para feedback inmediato (esto ya no tiene el if(!isRunning))
+            }
+            return particlesWereActuallyAdded;
+        }
+
+        function getWorldPosFromMouseEvent(event) {
+            if (!webglCanvas || !pixelsPerMeter) return null;
+            const rect = webglCanvas.getBoundingClientRect();
+            const mouseX_canvas = event.clientX - rect.left;
+            const mouseY_canvas = event.clientY - rect.top;
+
+            const worldX = mouseX_canvas / pixelsPerMeter;
+            const worldY = (webglCanvas.height - mouseY_canvas) / pixelsPerMeter; // Invertir Y
+            return { x: worldX, y: worldY };
+        }
+
+        function addParticlesAtPoint(worldX, worldY, count = 1, spreadRadius = 0.02) { // Aumentado spreadRadius
+            if (!simulator) return;
+
+            const domainWidth = simulator.getDomainWidthMeters();
+            const domainHeight = simulator.getDomainHeightMeters();
+            const h = simulator.grid.cellSize;
+            const safetyMarginFromEdge = h * 0.1; // Para no añadirlas justo en el borde
+
+            for (let i = 0; i < count; i++) {
+                let rX = worldX;
+                let rY = worldY;
+                if (count > 1 && spreadRadius > 0) { // Añadir jitter si hay múltiples partículas
+                    rX += (Math.random() - 0.5) * 2 * spreadRadius;
+                    rY += (Math.random() - 0.5) * 2 * spreadRadius;
+                }
+
+                // Clampear a los límites del dominio (con un pequeño margen)
+                const x = Math.max(safetyMarginFromEdge, Math.min(rX, domainWidth - safetyMarginFromEdge));
+                const y = Math.max(safetyMarginFromEdge, Math.min(rY, domainHeight - safetyMarginFromEdge));
+
+                // Comprobar si la celda objetivo es sólida
+                const cell_i = Math.floor(x / h);
+                const cell_j = Math.floor(y / h);
+
+                if (cell_i >= 0 && cell_i < simulator.grid.nx && cell_j >= 0 && cell_j < simulator.grid.ny) {
+                    if (simulator.grid.isSolid[cell_i][cell_j]) {
+                        // console.log("Intento de añadir partícula en celda sólida. Ignorado.");
+                        continue; // No añadir en celda sólida
+                    }
+                } else {
+                    continue; // Fuera de la rejilla principal
+                }
+                simulator.addParticle(x, y, 0, 0); // Usa el método existente de tu simulador
+            }
+        }
+
+        /*function addParticlesAlongLine(x0, y0, x1, y1) {
+            if (!simulator) return;
+            const dx = x1 - x0;
+            const dy = y1 - y0;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+
+            // Espaciado deseado entre partículas al dibujar una línea
+            // Podría ser, por ejemplo, una fracción del tamaño de celda o un radio de partícula deseado
+            const particleDrawSpacing = simulator.grid.cellSize * 0.25; // Ejemplo: 4 partículas por tamaño de celda
+
+            if (dist < particleDrawSpacing * 0.5) { // Si es un movimiento muy corto
+                addParticlesAtPoint(x1, y1, 1, simulator.grid.cellSize * 0.1); // Añadir una con un pequeño spread
+                return;
+            }
+
+            const numParticlesToAdd = Math.max(1, Math.floor(dist / particleDrawSpacing));
+
+            for (let i = 0; i <= numParticlesToAdd; i++) {
+                const t = i / numParticlesToAdd;
+                const x = x0 + t * dx;
+                const y = y0 + t * dy;
+                // Añadir una partícula con un pequeño radio de dispersión para que no se alineen perfectamente
+                addParticlesAtPoint(x, y, 1, simulator.grid.cellSize * 0.1); 
+            }
+        }*/
+
+        function drawLineAndAddParticlesDetailed(x0_cell, y0_cell, x1_cell, y1_cell) {
+            if (!simulator) return;
+            let dx = Math.abs(x1_cell - x0_cell);
+            let dy = -Math.abs(y1_cell - y0_cell);
+            let sx = x0_cell < x1_cell ? 1 : -1;
+            let sy = y0_cell < y1_cell ? 1 : -1;
+            let err = dx + dy;
+            let e2;
+            let currentX = x0_cell;
+            let currentY = y0_cell;
+
+            while (true) {
+                // Para la línea, cada celda es un "nuevo toque" dentro del trazo actual.
+                // El timer de PARTICLE_ADD_INTERVAL_MS no debería impedir el llenado inicial de la línea.
+                // cellsFilledInCurrentStroke se encarga de que no se llene múltiples veces en el mismo trazo.
+                attemptParticleAdd(currentX, currentY, true); // true para isPartOfLineStroke
+
+                if (currentX === x1_cell && currentY === y1_cell) break;
+                e2 = 2 * err;
+                let prevX = currentX; let prevY = currentY;
+                if (e2 >= dy) { if (currentX === x1_cell && prevX === x1_cell && sx > 0 && x1_cell < simulator.grid.nx -1 ) { /*pequeña correccion para evitar sobrepasar en linea recta horizontal*/ } else if (currentX === x1_cell && prevX === x1_cell && sx < 0 && x1_cell > 0) {/**/} else {err += dy; currentX += sx;} }
+                if (e2 <= dx) { if (currentY === y1_cell && prevY === y1_cell && sy > 0 && y1_cell < simulator.grid.ny -1) { /*pequeña correccion para evitar sobrepasar en linea recta vertical*/ } else if (currentY === y1_cell && prevY === y1_cell && sy < 0 && y1_cell > 0) {/**/} else {err += dx; currentY += sy;} }
+                if (currentX === prevX && currentY === prevY && !(currentX === x1_cell && currentY === y1_cell) ) break; // Safety break
+            }
+        }
+
+        function addParticlesAlongLineByCell(x0_cell, y0_cell, x1_cell, y1_cell) {
+            if (!simulator) return;
+            // ... (lógica de Bresenham como la tenías)
+            let dx = Math.abs(x1_cell - x0_cell);
+            let dy = -Math.abs(y1_cell - y0_cell);
+            let sx = x0_cell < x1_cell ? 1 : -1;
+            let sy = y0_cell < y1_cell ? 1 : -1;
+            let err = dx + dy;
+            let e2;
+            let somethingChangedThisCall = false;
+
+            let currentX = x0_cell;
+            let currentY = y0_cell;
+
+            while (true) {
+                const cellKey = `${currentX}-${currentY}`;
+                // SOLO AÑADIR PARTÍCULAS Y MARCAR COMO PROCESADA SI NO SE HA HECHO EN ESTE DRAG
+                if (!cellsProcessedInCurrentDrag.has(cellKey)) {
+                    if (simulator.addParticlesInCell(currentX, currentY)) { // addParticlesInCell ahora limpia y luego añade
+                        cellsProcessedInCurrentDrag.add(cellKey);
+                        somethingChangedThisCall = true;
+                    }
+                }
+                // Si la celda ya estaba en cellsProcessedInCurrentDrag, no hacemos nada,
+                // lo que significa que no se vuelve a llamar a addParticlesInCell para ella en este arrastre.
+
+                if (currentX === x1_cell && currentY === y1_cell) break;
+                e2 = 2 * err;
+                // Cuidado con salirse del bucle si e2==dy o e2==dx y ya se está en el límite
+                let prevX = currentX;
+                let prevY = currentY;
+                if (e2 >= dy) { err += dy; currentX += sx; }
+                if (e2 <= dx) { err += dx; currentY += sy; }
+                // Si no hubo movimiento, forzar salida para evitar bucle infinito si dx o dy es 0
+                if (currentX === prevX && currentY === prevY && !(currentX === x1_cell && currentY === y1_cell) ) {
+                    // console.warn("Bresenham atascado, forzando salida.");
+                    break;
+                }
+            }
+
+            if (somethingChangedThisCall) {
+                drawSceneWebGL(); 
+            }
+        }
+
+        function paintSolidCell(event) {
+            if (!webglCanvas || !simulator || !pixelsPerMeter) return;
+
+            // Leer el tamaño del pincel del input si lo tienes, o usar la variable global
+            const brushInput = document.getElementById('brushSizeInput');
+            if (brushInput) {
+                brushSize = parseInt(brushInput.value) || 1;
+            }
+            // brushSize ahora determinará cuántas celdas adicionales pintar alrededor del centro.
+            // Si brushSize = 1, pinta solo la celda central (comportamiento actual)
+            // Si brushSize = 2, pinta un cuadrado de 3x3 (centro + 1 celda alrededor)
+            // Si brushSize = N, pinta un cuadrado de (2N-1)x(2N-1)
+            // O más simple: brushSize es el radio en celdas.
+            const paintRadius = Math.max(0, brushSize - 1); // Si brushSize=1, radio=0. Si brushSize=2, radio=1.
+
+            const rect = webglCanvas.getBoundingClientRect();
+            const mouseX_canvas = event.clientX - rect.left;
+            const mouseY_canvas = event.clientY - rect.top;
+
+            const mouseX_world = mouseX_canvas / pixelsPerMeter;
+            const mouseY_world = (webglCanvas.height - mouseY_canvas) / pixelsPerMeter;
+
+            const h = simulator.grid.cellSize;
+            const center_i = Math.floor(mouseX_world / h);
+            const center_j = Math.floor(mouseY_world / h);
+
+            const nx = simulator.grid.nx;
+            const ny = simulator.grid.ny;
+
+            let paintedSomething = false; // Para saber si redibujar
+
+            for (let offsetY = -paintRadius; offsetY <= paintRadius; offsetY++) {
+                for (let offsetX = -paintRadius; offsetX <= paintRadius; offsetX++) {
+                    const i = center_i + offsetX;
+                    const j = center_j + offsetY;
+
+                    if (i >= 0 && i < nx && j >= 0 && j < ny) {
+                        if (!simulator.grid.isSolid[i][j]) {
+                            simulator.grid.isSolid[i][j] = 1;
+                            simulator.grid.isFluid[i][j] = 0;
+                            removeParticlesFromCell(i, j);
+                            paintedSomething = true;
+                        }
+                    }
+                }
+            }
+
+            if (paintedSomething && !isRunning) {
+                drawSceneWebGL();
+            }
+        }
+
+        function removeParticlesFromCell(cell_i, cell_j) {
+            if (!simulator || !simulator.particles) return;
+
+            const h = simulator.grid.cellSize;
+            const cellMinX = cell_i * h;
+            const cellMaxX = (cell_i + 1) * h;
+            const cellMinY = cell_j * h;
+            const cellMaxY = (cell_j + 1) * h;
+
+            // Filtrar el array de partículas, manteniendo solo las que NO están en la celda
+            simulator.particles = simulator.particles.filter(p => {
+                return !(p.x >= cellMinX && p.x < cellMaxX && 
+                        p.y >= cellMinY && p.y < cellMaxY);
+            });
+        }
+
+        function getCellFromMouseEvent(event) {
+            if (!webglCanvas || !simulator || !pixelsPerMeter) return null;
+            const rect = webglCanvas.getBoundingClientRect();
+            const mouseX_canvas = event.clientX - rect.left;
+            const mouseY_canvas = event.clientY - rect.top;
+
+            const mouseX_world = mouseX_canvas / pixelsPerMeter;
+            const mouseY_world = (webglCanvas.height - mouseY_canvas) / pixelsPerMeter;
+
+            const h = simulator.grid.cellSize;
+            const i = Math.floor(mouseX_world / h);
+            const j = Math.floor(mouseY_world / h);
+            return { i, j };
+        }
+
+        function applyPaintToAreaAccordingToMode(center_i, center_j) {
+            if (!simulator) return false;
+
+            const brushInputVal = document.getElementById('brushSizeInput') ? parseInt(document.getElementById('brushSizeInput').value) : brushSize;
+            const paintRadius = Math.max(0, brushInputVal - 1);
+
+            const nx = simulator.grid.nx;
+            const ny = simulator.grid.ny;
+            let changedSomethingInArea = false;
+
+            for (let offsetY = -paintRadius; offsetY <= paintRadius; offsetY++) {
+                for (let offsetX = -paintRadius; offsetX <= paintRadius; offsetX++) {
+                    const i = center_i + offsetX;
+                    const j = center_j + offsetY;
+
+                    if (i >= 0 && i < nx && j >= 0 && j < ny) {
+                        let cellChanged = false;
+                        if (currentPaintMode === 'paint') {
+                            if (!simulator.grid.isSolid[i][j]) {
+                                simulator.grid.isSolid[i][j] = 1;
+                                simulator.grid.isFluid[i][j] = 0;
+                                removeParticlesFromCell(i, j);
+                                cellChanged = true;
+                            }
+                        } else { // currentPaintMode === 'erase'
+                            if (simulator.grid.isSolid[i][j]) {
+                                simulator.grid.isSolid[i][j] = 0;
+                                // No es necesario modificar isFluid aquí, se volverá aire.
+                                cellChanged = true;
+                            }
+                        }
+                        if (cellChanged) {
+                            changedSomethingInArea = true;
+                        }
+                    }
+                }
+            }
+
+            if (changedSomethingInArea) {
+                drawSceneWebGL();
+            }
+            return changedSomethingInArea;
+        }
+
+        function drawLineBetweenCellsAccordingToMode(x0, y0, x1, y1) {
+            let dx = Math.abs(x1 - x0);
+            let dy = -Math.abs(y1 - y0);
+            let sx = x0 < x1 ? 1 : -1;
+            let sy = y0 < y1 ? 1 : -1;
+            let err = dx + dy;
+            let e2;
+            // let paintedSomethingOverall = false; // No necesitamos redibujar desde aquí si applyPaintToAreaAccordingToMode lo hace
+
+            while (true) {
+                // applyPaintToAreaAccordingToMode se encarga de la lógica de pintar/borrar y de redibujar si es necesario
+                applyPaintToAreaAccordingToMode(x0, y0);
+                // if (applyPaintToAreaAccordingToMode(x0, y0)) {
+                //     paintedSomethingOverall = true;
+                // }
+
+                if (x0 === x1 && y0 === y1) break;
+                e2 = 2 * err;
+                if (e2 >= dy) { err += dy; x0 += sx; }
+                if (e2 <= dx) { err += dx; y0 += sy; }
+            }
+            // No es necesario un drawSceneWebGL() aquí si applyPaintToAreaAccordingToMode ya lo hace cuando hay cambios.
+        }
+
+        function addContinuousParticleSource(cell_i, cell_j, durationSimSeconds, initialVx = 0.0, initialVy = 0.0) { // Valores por defecto
+            if (!simulator || 
+                cell_i < 0 || cell_i >= simulator.grid.nx || 
+                cell_j < 0 || cell_j >= simulator.grid.ny) {
+                console.error("No se puede añadir emisor: celda inválida o simulador no listo.");
+                return;
+            }
+
+            const newSource = {
+                ci: cell_i,
+                cj: cell_j,
+                startSimTime: simulator.simulationTime,
+                durationSimTime_s: durationSimSeconds,
+                lastAddTime_ms: 0, // Para el intervalo de PARTICLE_ADD_INTERVAL_MS si lo reintroducimos
+                isActive: true,
+                emitVx: initialVx, // NUEVO
+                emitVy: initialVy  // NUEVO
+            };
+            activeParticleSources.push(newSource);
+            //console.log(`Emisor de partículas AÑADIDO en celda (${cell_i}, ${cell_j}) por ${durationSimSeconds}s. Fuente:`, JSON.stringify(newSource));
+            //console.log("Contenido actual de activeParticleSources:", JSON.stringify(activeParticleSources));
+        }
+
+        /*
+        function processActiveParticleSources() {
+            if (!simulator || activeParticleSources.length === 0) {
+                return;
+            }
+
+            const currentPerfTime = performance.now(); // Para el intervalo de adición
+            const currentSimTime = simulator.simulationTime; // Para la duración total
+            let sceneChangedBySource = false;
+
+            for (let i = activeParticleSources.length - 1; i >= 0; i--) { // Iterar hacia atrás permite borrar de forma segura
+                const source = activeParticleSources[i];
+
+                if (!source.isActive) {
+                    continue;
+                }
+
+                // Comprobar duración del emisor
+                if ((currentSimTime - source.startSimTime) > source.durationSimTime_s) {
+                    source.isActive = false;
+                    console.log(`Emisor en (${source.ci}, ${source.cj}) finalizado por duración.`);
+                    continue;
+                }
+
+                // Comprobar intervalo de adición de partículas
+                if ((currentPerfTime - source.lastAddTime_ms) >= PARTICLE_ADD_INTERVAL_MS) {
+                if (simulator.addParticlesInCell(source.ci, source.cj, isRunning)) {
+                    source.lastAddTime_ms = currentPerfTime; // Actualizar con tiempo real
+                        sceneChangedBySource = true;
+                    }
+                }
+            }
+
+            // Opcional: Limpiar emisores inactivos del array para optimizar
+            // Esto se puede hacer con menos frecuencia si hay muchos emisores
+            if (activeParticleSources.some(s => !s.isActive)) { // Solo filtrar si hay algo inactivo
+                activeParticleSources = activeParticleSources.filter(source => source.isActive);
+            }
+
+
+            // Si un emisor añadió partículas y la simulación está pausada,
+            // necesitamos forzar un redibujado para verlas.
+            // Si la simulación está corriendo, el gameLoop principal se encargará del redibujado.
+            if (sceneChangedBySource && !isRunning) {
+                drawSceneWebGL();
+            }
+        }
+*/
+        function processActiveParticleSources() {
+            if (!simulator || activeParticleSources.length === 0) {
+                return;
+            }
+
+            const currentSimTime = simulator.simulationTime;
+            let sceneChangedBySource = false; // Esta variable la usabas para redibujar si !isRunning
+
+            for (let i = activeParticleSources.length - 1; i >= 0; i--) {
+                const source = activeParticleSources[i];
+
+                if (!source.isActive) {
+                    continue;
+                }
+
+                if ((currentSimTime - source.startSimTime) > source.durationSimTime_s) {
+                    source.isActive = false;
+                    console.log(`Emisor programado en (${source.ci}, ${source.cj}) finalizado por duración (tiempo de simulación).`);
+                    continue;
+                }
+
+                // Si el emisor está activo y dentro de su duración, AÑADE PARTÍCULAS
+                // La variable global 'isRunning' se pasa a addParticlesInCell
+                if (simulator.addParticlesInCell(source.ci, source.cj, isRunning, source.emitVx, source.emitVy)) {
+                    // No necesitamos source.lastAddTime_ms si se dispara cada step
+                    sceneChangedBySource = true; // Registra si se añadieron partículas
+                }
+            }
+
+            if (activeParticleSources.some(s => !s.isActive)) {
+                activeParticleSources = activeParticleSources.filter(source => source.isActive);
+            }
+
+            // El redibujado por cambio de fuente ahora se maneja principalmente por el gameLoop general,
+            // pero si quieres un feedback inmediato si la simulación está pausada y una fuente añade algo:
+            if (sceneChangedBySource && !isRunning) { // (Esta condición es por si permites que los emisores funcionen en pausa)
+                drawSceneWebGL();
+            }
+        }
+
+        function addParticlesInBrushAreaUI(center_i, center_j, isPartOfActiveStroke) {
+            if (!simulator) return false;
+
+            // Leer el tamaño del pincel (igual que para sólidos y emisores)
+            const brushInputEl = document.getElementById('brushSizeInput');
+            const currentBrushValue = brushInputEl ? parseInt(brushInputEl.value) : brushSize; // 'brushSize' es tu variable global
+
+            const paintRadius = Math.max(0, currentBrushValue - 1);
+            let overallParticlesAddedInArea = false;
+
+            for (let offsetY = -paintRadius; offsetY <= paintRadius; offsetY++) {
+                for (let offsetX = -paintRadius; offsetX <= paintRadius; offsetX++) {
+                    const i = center_i + offsetX;
+                    const j = center_j + offsetY;
+
+                    // attemptAndAddParticlesUI se encarga de la lógica de si realmente se añaden
+                    // partículas a la celda (i,j) basado en el stroke y el timer.
+                    // Pasamos el flag isPartOfActiveStroke tal cual.
+                    if (attemptAndAddParticlesUI(i, j, isPartOfActiveStroke)) {
+                        overallParticlesAddedInArea = true;
+                    }
+                }
+            }
+
+            // El redibujado ya lo maneja attemptAndAddParticlesUI si algo cambió.
+            // No es necesario un drawSceneWebGL() aquí explícitamente a menos que
+            // attemptAndAddParticlesUI no lo hiciera y solo devolviera true/false.
+            // (Actualmente attemptAndAddParticlesUI sí llama a drawSceneWebGL)
+
+            return overallParticlesAddedInArea;
+        }
+
+        function applyEmitterToggleToArea(center_i, center_j) {
+            if (!simulator) return false;
+
+            const brushInputEl = document.getElementById('brushSizeInput'); // Obtener el elemento input
+            const currentBrushValue = brushInputEl ? parseInt(brushInputEl.value) : brushSize; 
+            const paintRadius = Math.max(0, currentBrushValue - 1);
+            const nx = simulator.grid.nx;
+            const ny = simulator.grid.ny;
+            let changedSomethingInArea = false;
+
+            for (let offsetY = -paintRadius; offsetY <= paintRadius; offsetY++) {
+                for (let offsetX = -paintRadius; offsetX <= paintRadius; offsetX++) {
+                    const i = center_i + offsetX;
+                    const j = center_j + offsetY;
+
+                    if (i >= 0 && i < nx && j >= 0 && j < ny) {
+                        let cellChanged = false;
+                        if (currentEmitterToggleMode === 'create') {
+                            if (!simulator.grid.isEmitterCell[i][j]) {
+                                simulator.grid.isEmitterCell[i][j] = 1;
+                                // Si una celda se vuelve emisora, no puede ser sólida.
+                                if (simulator.grid.isSolid[i][j]) {
+                                    simulator.grid.isSolid[i][j] = 0;
+                                    // Si estaba en fase de setup, quitar partículas de la celda que se volvió sólida
+                                    if (!isRunning) removeParticlesFromCell(i,j);
+                                }
+                                cellChanged = true;
+                            }
+                        } else { // currentEmitterToggleMode === 'erase'
+                            if (simulator.grid.isEmitterCell[i][j]) {
+                                simulator.grid.isEmitterCell[i][j] = 0;
+                                // Opcional: limpiar el timestamp para esta celda si se desactiva
+                                uiEmitterLastAddTime.delete(`<span class="math-inline">\{i\}\-</span>{j}`);
+                                cellChanged = true;
+                            }
+                        }
+                        if (cellChanged) changedSomethingInArea = true;
+                    }
+                }
+            }
+            if (changedSomethingInArea) {
+                // Podrías querer un redibujado diferente para emisores si los visualizas
+                // Por ahora, un redibujado general está bien.
+                drawSceneWebGL();
+            }
+            return changedSomethingInArea;
+        }
+        
+        function drawLineAndToggleEmitters(x0_cell, y0_cell, x1_cell, y1_cell) {
+            if (!simulator) return;
+            let dx = Math.abs(x1_cell - x0_cell);
+            let dy = -Math.abs(y1_cell - y0_cell);
+            let sx = x0_cell < x1_cell ? 1 : -1;
+            let sy = y0_cell < y1_cell ? 1 : -1;
+            let err = dx + dy;
+            let e2;
+            let currentX = x0_cell;
+            let currentY = y0_cell;
+
+            while (true) {
+                applyEmitterToggleToArea(currentX, currentY);
+                if (currentX === x1_cell && currentY === y1_cell) break;
+                e2 = 2 * err;
+                let prevX = currentX; let prevY = currentY;
+                if (e2 >= dy) { err += dy; currentX += sx; }
+                if (e2 <= dx) { err += dx; currentY += sy; }
+                if (currentX === prevX && currentY === prevY && !(currentX === x1_cell && currentY === y1_cell)) break;
+            }
+            // El redibujado se maneja dentro de applyEmitterToggleToArea
+        }
+
+        function processUIEmitters() {
+            if (!simulator) return;
+
+            // const currentTime = Date.now(); // Ya no es necesario para el intervalo de disparo
+            let particlesAddedByUIEmitters = false;
+
+            for (let i = 0; i < simulator.grid.nx; i++) {
+                for (let j = 0; j < simulator.grid.ny; j++) {
+                    if (simulator.grid.isEmitterCell[i][j] === 1) { // Si la celda es un emisor de UI activo
+                        // const cellKey = `uiemitter-${i}-${j}`; // No es necesario para el timestamp
+                        // const lastAddTime = uiEmitterLastAddTime.get(cellKey) || 0; // No es necesario
+
+                        // ELIMINAMOS LA CONDICIÓN DE TIEMPO:
+                        // if ((currentTime - lastAddTime) >= PARTICLE_ADD_INTERVAL_MS) {
+                        
+                        // Ahora, si es un emisor, siempre intenta añadir partículas en esta llamada
+                        // (que ocurre una vez por gameLoop si isRunning es true)
+                        if (simulator.addParticlesInCell(i, j, isRunning, UI_EMITTER_DEFAULT_VX, UI_EMITTER_DEFAULT_VY)) {
+                            // uiEmitterLastAddTime.set(cellKey, currentTime); // Ya no es necesario si se dispara cada step
+                            particlesAddedByUIEmitters = true;
+                        }
+                        // } // Fin del if de tiempo eliminado
+                    }
+                }
+            }
+
+            if (particlesAddedByUIEmitters) {
+                // El redibujado se maneja en gameLoop o si !isRunning para feedback inmediato
+                if (!isRunning) drawSceneWebGL(); 
+            }
+        }
+
+        function drawParticleCountGraph() {
+            if (!simulator || !particleCountGraphCtx) return;
+
+            const actualData = simulator.getParticleCountHistory();
+            //const theoreticalData = theoreticalParticleCountHistoryData; // Usar el array global
+
+            const totalSimTime = simulator.simulationTime;
+
+            particleCountGraphCtx.clearRect(0, 0, particleCountGraphCanvas.width, particleCountGraphCanvas.height);
+            particleCountGraphCtx.strokeStyle = 'black';
+            particleCountGraphCtx.lineWidth = 1;
+
+            // --- LÍMITES Y ESCALA DEL GRÁFICO ---
+               // --- LÍMITES Y ESCALA DEL GRÁFICO ---
+            const MAX_GRAPH_TIME_S = 80.0;
+            const displayTotalSimTime = Math.min(totalSimTime, MAX_GRAPH_TIME_S);
+            const logStartTime = Math.log(1 + 0);
+            const logEndTime = (displayTotalSimTime > 0) ? Math.log(1 + displayTotalSimTime) : Math.log(1 + 1);
+            const logTimeRange = Math.max(logEndTime - logStartTime, Math.log(1.1)); // Evitar rango cero
+
+            // Eje Y (Conteo de Partículas): Considerar ambos datasets para el máximo
+            let maxYValueFromData = 0;
+            for (const point of actualData) {
+                if (point.time <= displayTotalSimTime && point.count > maxYValueFromData) {
+                    maxYValueFromData = point.count;
+                }
+            }
+            /*
+            for (const point of theoreticalData) { // También considerar el teórico
+                if (point.time <= displayTotalSimTime && point.count > maxYValueFromData) {
+                    maxYValueFromData = point.count;
+                }
+            }
+            // Un valor por defecto si no hay datos o son muy bajos
+            if (maxYValueFromData < 100 && (actualData.length <= 1 && theoreticalData.length <=1) ) maxYValueFromData = 1000;
+        */
+
+                const minYValue = 0;
+                const graphMinYDisplay = 0;
+                const graphMaxYDisplay = Math.max(100, maxYValueFromData * 1.1); // +10% padding, mínimo 100
+
+                // Dibujar ejes (simplificado, como lo tenías)
+                particleCountGraphCtx.beginPath();
+                particleCountGraphCtx.moveTo(0, particleCountGraphCanvas.height); 
+                particleCountGraphCtx.lineTo(particleCountGraphCanvas.width, particleCountGraphCanvas.height);
+                particleCountGraphCtx.strokeStyle = 'grey';
+                particleCountGraphCtx.lineWidth = 1;
+                particleCountGraphCtx.stroke();
+                // Aquí podrías añadir etiquetas para los ejes X (Tiempo) e Y (Nº Partículas)
+
+                // --- Dibujar línea de CONTEO REAL de partículas ---
+                if (actualData.length > 0) { 
+                    particleCountGraphCtx.strokeStyle = 'DarkOrchid'; // O el color que prefieras
+                    particleCountGraphCtx.lineWidth = 2;
+                    particleCountGraphCtx.beginPath();
+                    let firstPointActual = true;
+                    for (const point of actualData) {
+                        if (point.time > displayTotalSimTime + 1e-3 && point.time > 0) {
+                            if (!firstPointActual) {
+                                const x = particleCountGraphCanvas.width;
+                                let yNorm = 0;
+                                if (graphMaxYDisplay > graphMinYDisplay) { yNorm = (point.count - graphMinYDisplay) / (graphMaxYDisplay - graphMinYDisplay); }
+                                const y = particleCountGraphCanvas.height * (1 - yNorm);
+                                particleCountGraphCtx.lineTo(x, Math.max(0, Math.min(particleCountGraphCanvas.height, y)));
+                            }
+                            break; 
+                        }
+
+                        const pointLogTime = Math.log(1 + point.time);
+                        let xNorm;
+                        if (logTimeRange <= Math.log(1.0001)) { 
+                            xNorm = (point.time > 0 || (point.time === 0 && logStartTime === Math.log(1))) ? ( (displayTotalSimTime > 0) ? point.time / displayTotalSimTime : 0.0) : 0.0;
+                        } else { 
+                            xNorm = (pointLogTime - logStartTime) / logTimeRange; 
+                        }
+                        
+                        const x = xNorm * particleCountGraphCanvas.width;
+                        let yNorm = 0;
+                        if (graphMaxYDisplay > graphMinYDisplay) { 
+                            yNorm = (point.count - graphMinYDisplay) / (graphMaxYDisplay - graphMinYDisplay); 
+                        }
+                        const y = particleCountGraphCanvas.height * (1 - yNorm); 
+
+                        const clampedX = Math.max(0, Math.min(particleCountGraphCanvas.width, x));
+                        const clampedY = Math.max(0, Math.min(particleCountGraphCanvas.height, y));
+
+                        if (firstPointActual) {
+                            particleCountGraphCtx.moveTo(clampedX, clampedY);
+                            firstPointActual = false;
+                        } else {
+                            particleCountGraphCtx.lineTo(clampedX, clampedY);
+                        }
+                    }
+                    particleCountGraphCtx.stroke();
+                }
+
+                // ELIMINADO: Bloque para dibujar la línea de conteo teórico
+
+                // Ajustar la leyenda (opcional)
+                particleCountGraphCtx.fillStyle = 'DarkOrchid'; // O el color que estés usando
+                particleCountGraphCtx.font = '10px Arial'; // Hacer la fuente un poco más pequeña
+                particleCountGraphCtx.fillText('Partículas Reales', 5, 12); // Ajustar posición si es necesario
+                // ELIMINADO: Texto para la leyenda de partículas teóricas
+            }
+
+        function setupSimulator() {
+            if (animationFrameId) {
+                cancelAnimationFrame(animationFrameId);
+            }
+            isRunning = false; 
+            document.getElementById('startButton').textContent = "Iniciar";
+
+            // --- NUEVO: Resetear el estado de la herramienta de pintura ---
+            isPaintingSolids = false;
+            lastPaintedCell = { i: -1, j: -1 }; // Indica que no hay una "última celda pintada"
+            currentPaintMode = 'paint';         // Modo de pintura por defecto
+            isAddingParticles = false;
+            lastProcessedCellForParticleLine = { i: -1, j: -1 };
+            if (particleAddIntervalId) { clearInterval(particleAddIntervalId); particleAddIntervalId = null; }
+
+            activeParticleSources = []; // Limpiar emisores al reiniciar
+
+            cellParticleAddTimestamps.clear(); // Limpiar los timestamps de adición de celdas
+            cellsFilledInCurrentStroke.clear(); // Limpiar las celdas procesadas en el trazo
+
+            isManagingEmitters = false;
+            currentEmitterToggleMode = 'create'; // Modo por defecto
+            uiEmitterLastAddTime.clear();      // Limpiar los timestamps de los emisores de UI
+
+            // theoreticalParticleCount = 0;
+            // theoreticalParticleCountHistoryData = [{ time: 0, count: 0 }]; // Iniciar con (0,0)
+
+            // --- FIN DEL NUEVO RESETEO ---
+
+            brushSize = parseInt(document.getElementById('brushSizeInput').value) || 1;
+
+            ///////////const domainWidthMeters = 2.0; 
+            ///////////const domainHeightMeters = 1.0; 
+
+            // --- LEER DIMENSIONES FÍSICAS DEL DOMINIO Y RESOLUCIÓN DE CELDA ---
+            const inputDomainWidth = parseFloat(document.getElementById('domainWidthInput').value) || 2.0;
+            const inputDomainHeight = parseFloat(document.getElementById('domainHeightInput').value) || 1.0;
+            const cellSizeMeters = parseFloat(document.getElementById('resInput').value) || 0.02;
+
+            if (inputDomainWidth <= 0 || inputDomainHeight <= 0 || cellSizeMeters <=0) {
+                alert("Las dimensiones del dominio y el tamaño de celda deben ser positivos.");
+                return;
+    }
+
+
+
+            //const cellSizeMeters = parseFloat(document.getElementById('resInput').value) || 0.02;
+            
+            simulator = new FLIPSimulator(inputDomainWidth, inputDomainHeight, cellSizeMeters);
+            simulator.numPressureIterations = parseInt(document.getElementById('iterInput').value) || 400;
+            simulator.pressureRelaxationFactor = 1.9
+            simulator.simulationTime = 0.0;
+            simulator.maxHeightData = [];
+            simulator.pressureIterationsData = []; 
+            simulator.hasComplexSolids = false; 
+            simulator.particleCountHistoryData = []; // NUEVO: Resetear historial de conteo
+
+            previousFrameTimestamp = 0; // Se inicializará en el primer frame de gameLoop
+            frameCountForFPS = 0;
+            timeAccumulatorForFPS = 0.0;
+            document.getElementById('simTimeDisplay').textContent = simulator.simulationTime.toFixed(2);
+            document.getElementById('fpsDisplay').textContent = "--";
+
+            simulator.boundaryOpen.top = false;
+            simulator.boundaryOpen.right = true;
+            simulator.boundaryOpen.left = false;
+            simulator.boundaryOpen.bottom = true; // Cuidado, las partículas caerán por aquí si la gravedad está activa
+
+            // --- LÓGICA DE AJUSTE DE TAMAÑO DEL CANVAS Y pixelsPerMeter ---
+            const simPhysicalWidth = simulator.getDomainWidthMeters();
+            const simPhysicalHeight = simulator.getDomainHeightMeters();
+
+            // Calcular factor de escala para que quepa en el ancho máximo y alto máximo
+            const scaleToFitWidth = MAX_CANVAS_DISPLAY_WIDTH_PX / simPhysicalWidth;
+            const scaleToFitHeight = MAX_CANVAS_DISPLAY_HEIGHT_PX / simPhysicalHeight;
+
+            // Obstáculos (igual que antes)
+            
+            const obstacleX = simulator.getDomainWidthMeters() * 0.6;
+            const obstacleY = 0.0; 
+            const obstacleWidth = simulator.getDomainWidthMeters() * 0.02;
+            const obstacleHeight = simulator.getDomainHeightMeters() * 0.1;
+            simulator.addSolidBox(obstacleX, obstacleY, obstacleWidth, obstacleHeight);
+            /*
+            simulator.addRotatedSolidBox(
+                simulator.getDomainWidthMeters() * 0.5,
+                simulator.getDomainHeightMeters() * 0.3,
+                simulator.getDomainWidthMeters() * 0.4,
+                simulator.getDomainHeightMeters() * 0.1,
+                30 
+            );
+            */
+            
+            // Configuración del canvas WebGL
+            const tempPixelsPerMeter = 400; // Estimación temporal para el ancho
+            pixelsPerMeter = Math.min(scaleToFitWidth, scaleToFitHeight);
+            //webglCanvas.height = Math.floor(simulator.getDomainHeightMeters() * pixelsPerMeter);
+            //webglCanvas.width = Math.floor(simulator.getDomainWidthMeters() * tempPixelsPerMeter);
+
+            webglCanvas.width = Math.floor(simPhysicalWidth * pixelsPerMeter);
+            webglCanvas.height = Math.floor(simPhysicalHeight * pixelsPerMeter);
+
+
+            if (!wgl) { // Inicializar wgl solo una vez
+                wgl = new WrappedGL(webglCanvas);
+                if (!wgl.gl) {
+                    wgl = new WrappedGL(webglCanvas);
+                    alert("WebGL no es compatible o está desactivado!");
+                    return;
+                }
+                // Siempre recrear o asegurar que el shader se crea/actualiza si cambias el source
+                particleShaderProgram = wgl.createProgram(particleVertexShaderSource, particleFragmentShaderSource);
+                //console.log('particleShaderProgram DEBUG:', particleShaderProgram); // <--- AÑADE ESTA LÍNEA
+
+                if (!particleShaderProgram || !particleShaderProgram.program) { // <--- AÑADE ESTA COMPROBACIÓN
+                    console.error("¡Error crítico! particleShaderProgram no es válido o no tiene una propiedad .program.");
+                    // Podrías detener la ejecución aquí o manejar el error para no intentar dibujar.
+                    return; // Salir de setupSimulator si el programa no es válido
+                }
+                if (!particleBuffer) { // Crear buffer solo si no existe
+                    particleBuffer = wgl.createBuffer();
+                }
+                if (!solidCellBuffer) { // Crear buffer solo si no existe
+                solidCellBuffer = wgl.createBuffer();
+                }
+                solidCellShaderProgram = wgl.createProgram(solidCellVertexShaderSource, solidCellFragmentShaderSource);
+                if (!solidCellShaderProgram || !solidCellShaderProgram.program) {
+                    console.error("¡Error crítico! solidCellShaderProgram no es válido.");
+                    return;
+                }
+            }
+           
+            wgl.gl.viewport(0, 0, wgl.gl.drawingBufferWidth, wgl.gl.drawingBufferHeight);
+
+            // Crear matriz de proyección
+            projectionMatrix = createOrthographicMatrix(0, simPhysicalWidth, 0, simPhysicalHeight, -1, 1);
+
+            // Configuración de gráficos 2D (igual que antes)
+            graphCanvas.width = webglCanvas.width; 
+            graphCanvas.height = 150; 
+            iterGraphCanvas.width = webglCanvas.width; 
+            iterGraphCanvas.height = 100; 
+
+            particleCountGraphCanvas.width = webglCanvas.width; // Mismo ancho que el de simulación
+            particleCountGraphCanvas.height = 120; // Altura para este gráfico (ajustable)
+
+/*
+            simulator.initializeFluidVolume(
+                0.0 * simulator.getDomainWidthMeters(),   
+                0.0 * simulator.getDomainHeightMeters(),   
+                0.5 * simulator.getDomainWidthMeters(),   
+                1.0 * simulator.getDomainHeightMeters(),  
+                //2                                         
+            );
+*/
+            //Dam break
+            
+            simulator.initializeFluidVolume(
+                0.0 * simulator.getDomainWidthMeters(),   
+                0.0 * simulator.getDomainHeightMeters(),   
+                0.2 * simulator.getDomainWidthMeters(),   
+                0.5 * simulator.getDomainHeightMeters(),  
+                //2                                         
+            );
+            
+            //Double splash
+            /*
+            simulator.initializeFluidVolume(
+                0.0 * simulator.getDomainWidthMeters(),   
+                0.0 * simulator.getDomainHeightMeters(),   
+                0.2 * simulator.getDomainWidthMeters(),   
+                1.0 * simulator.getDomainHeightMeters(),  
+                //2                                         
+            );
+
+            simulator.initializeFluidVolume(
+                0.8 * simulator.getDomainWidthMeters(),   
+                0.0 * simulator.getDomainHeightMeters(),   
+                0.2 * simulator.getDomainWidthMeters(),   
+                1.0 * simulator.getDomainHeightMeters(),  
+                //2                                         
+            );
+            */
+
+            //Block drop
+            /*
+            simulator.initializeFluidVolume(
+                0.0 * simulator.getDomainWidthMeters(),   
+                0.0 * simulator.getDomainHeightMeters(),   
+                1.0 * simulator.getDomainWidthMeters(),   
+                0.35 * simulator.getDomainHeightMeters(),  
+                //2                                         
+            );
+
+            simulator.initializeFluidVolume(
+                0.4 * simulator.getDomainWidthMeters(),   
+                0.7 * simulator.getDomainHeightMeters(),   
+                0.2 * simulator.getDomainWidthMeters(),   
+                0.2 * simulator.getDomainHeightMeters(),  
+                //2                                         
+            );
+            */
+            /*
+            ///////////// Añadir emitters
+            // Obtén las dimensiones de la rejilla del simulador
+            const nx = simulator.grid.nx;
+            const ny = simulator.grid.ny;
+
+            // Define las coordenadas de la celda donde quieres el emisor
+            let target_i_izquierdo = 5;
+            let target_j_izquierdo = Math.floor(ny / 2); // A media altura
+
+            // Comprueba si la celda (target_i_izquierdo, target_j_izquierdo) es válida
+            if (target_i_izquierdo >= 0 && target_i_izquierdo < nx &&
+                target_j_izquierdo >= 0 && target_j_izquierdo < ny) {
+                addContinuousParticleSource(target_i_izquierdo, target_j_izquierdo, 10.0);
+            } else {
+                console.warn(`La celda (${target_i_izquierdo}, ${target_j_izquierdo}) está fuera de los límites de la rejilla [${nx}x${ny}]. No se añadió el emisor izquierdo.`);
+            }
+
+            */
+            /* Este es una manera de hacer los emitters que no me gusta. mejor la de arriba
+            const gridResX = simulator.grid.nx;
+            const gridResY = simulator.grid.ny;
+            if (gridResX > 5 && gridResY > 25) { // Comprobación simple de límites
+                addContinuousParticleSource(5, Math.floor(gridResY / 2) , 10.0); // Emisor en el borde izquierdo, a media altura
+            }
+            if (gridResX > gridResX - 6 && gridResY > 25) {
+                addContinuousParticleSource(gridResX - 6, Math.floor(gridResY / 2), 10.0); // Emisor en el borde derecho
+            }
+            */
+/*
+            if (simulator && simulator.grid.nx > 10 && simulator.grid.ny > 10) { // Asegurar que la celda (5,5) es válida
+                console.log("Intentando añadir emisor de prueba en (5,5)...");
+                addContinuousParticleSource(5, 90, 80.0, 4, 0); // Emisor en (5,5) por 80s de simulación
+            } else {
+                console.warn("Rejilla no es suficientemente grande para el emisor de prueba en (5,5)");
+            }
+*/
+            console.log("Simulador y canvas WebGL configurados.");
+            
+            // Dibujar el primer frame
+            drawSceneWebGL(); 
+            drawHeightGraph(); 
+            drawPressureIterationsGraph(); 
+            drawParticleCountGraph(); // Dibujar gráfico inicial (vacío)
+
+        }
+
+        
+
+        // --- MODIFICADO: drawSimulation ahora es drawSceneWebGL ---
+        function drawSceneWebGL() {
+            if (!simulator || !wgl || !particleShaderProgram || !particleBuffer) return;
+
+            // --- PASO 1: PREPARAR DATOS DE LAS CELDAS SÓLIDAS (MOVER ESTE BLOQUE AL INICIO) ---
+            const solidCellsVertices = [];
+            const hGrid = simulator.grid.cellSize; // Usar un nombre diferente para evitar conflicto con 'h' si se usa más tarde
+            const nxGrid = simulator.grid.nx;
+            const nyGrid = simulator.grid.ny;
+
+            for (let i = 0; i < nxGrid; i++) {
+                for (let j = 0; j < nyGrid; j++) {
+                    if (simulator.grid.isSolid[i][j]) {
+                        const x0 = i * hGrid;
+                        const y0 = j * hGrid;
+                        const x1 = (i + 1) * hGrid;
+                        const y1 = (j + 1) * hGrid;
+
+                        solidCellsVertices.push(x0, y0); solidCellsVertices.push(x1, y0); solidCellsVertices.push(x0, y1);
+                        solidCellsVertices.push(x0, y1); solidCellsVertices.push(x1, y0); solidCellsVertices.push(x1, y1);
+                    }
+                }
+            }
+            // Definir solidCellDataArray DESPUÉS de que solidCellsVertices esté lleno
+            const solidCellDataArray = new Float32Array(solidCellsVertices);
+            // --- FIN DE PREPARACIÓN DE DATOS DE CELDAS SÓLIDAS ---
+
+            // --- PASO 2: PREPARAR DATOS DE PARTÍCULAS (como lo tenías) ---
+            const numParticles = simulator.particles.length;
+            let particleData; // Declarar fuera del if
+            if (numParticles > 0) {
+                particleData = new Float32Array(numParticles * 4);
+                for (let i = 0; i < numParticles; i++) {
+                    const p = simulator.particles[i];
+                    particleData[i * 4 + 0] = p.x;
+                    particleData[i * 4 + 1] = p.y;
+                    particleData[i * 4 + 2] = p.vx;
+                    particleData[i * 4 + 3] = p.vy;
+                }
+                // Subir datos al buffer de GPU para partículas
+                wgl.bufferData(particleBuffer, wgl.ARRAY_BUFFER, particleData, wgl.DYNAMIC_DRAW);
+            }
+            
+            // --- PASO 3: LIMPIAR EL CANVAS WebGL ---
+            const clearState = wgl.createClearState().clearColor(0.85, 0.90, 0.95, 1.0);
+            wgl.clear(clearState, wgl.COLOR_BUFFER_BIT);
+
+            // --- PASO 4: DIBUJAR CELDAS SÓLIDAS (si hay alguna) ---
+            // Esta es la sección que probablemente estaba causando el error si se ejecutaba antes de definir solidCellDataArray
+            if (solidCellDataArray.length > 0 && solidCellShaderProgram && solidCellShaderProgram.program && solidCellBuffer) {
+                // Subir datos de celdas sólidas al buffer (solo si hay datos)
+                wgl.bufferData(solidCellBuffer, wgl.ARRAY_BUFFER, solidCellDataArray, wgl.DYNAMIC_DRAW); 
+
+                const solidDrawState = wgl.createDrawState()
+                    .useProgram(solidCellShaderProgram)
+                    .uniformMatrix4fv('u_projectionMatrix', false, projectionMatrix)
+                    .uniform4f('u_solidColor', 0.5, 0.5, 0.5, 1.0); // Color gris
+
+                const cellPosLocation = solidCellShaderProgram.getAttribLocation('a_cellPosition');
+                if (cellPosLocation !== -1 && cellPosLocation !== undefined) {
+                    solidDrawState.vertexAttribPointer(solidCellBuffer, cellPosLocation, 2, wgl.FLOAT, false, 0, 0);
+                }
+                wgl.drawArrays(solidDrawState, wgl.TRIANGLES, 0, solidCellDataArray.length / 2);
+            }
+
+                // --- ***** NUEVO: DIBUJAR CELDAS EMISORAS ***** ---
+                const emitterCellsVertices = [];
+                for (let i = 0; i < nxGrid; i++) {
+                    for (let j = 0; j < nyGrid; j++) {
+                        if (simulator.grid.isEmitterCell[i][j] === 1 && !simulator.grid.isSolid[i][j]) { // Solo si es emisor Y NO es sólido
+                            const x0 = i * hGrid; const y0 = j * hGrid;
+                            const x1 = (i + 1) * hGrid; const y1 = (j + 1) * hGrid;
+                            emitterCellsVertices.push(x0, y0); emitterCellsVertices.push(x1, y0); emitterCellsVertices.push(x0, y1);
+                            emitterCellsVertices.push(x0, y1); emitterCellsVertices.push(x1, y0); emitterCellsVertices.push(x1, y1);
+                        }
+                    }
+                }
+                const emitterCellDataArray = new Float32Array(emitterCellsVertices);
+
+                if (emitterCellDataArray.length > 0 && solidCellShaderProgram && solidCellShaderProgram.program && solidCellBuffer) {
+                    // Reutilizamos el buffer de las celdas sólidas. Los datos anteriores se sobrescriben.
+                    wgl.bufferData(solidCellBuffer, wgl.ARRAY_BUFFER, emitterCellDataArray, wgl.DYNAMIC_DRAW); 
+
+                    // Reutilizamos el shader de las celdas sólidas, pero con un color diferente.
+                    const emitterDrawState = wgl.createDrawState()
+                        .useProgram(solidCellShaderProgram) // Mismo shader que los sólidos
+                        .uniformMatrix4fv('u_projectionMatrix', false, projectionMatrix)
+                        .uniform4f('u_solidColor', 0.2, 0.8, 0.2, 0.7); // Color verde semi-transparente para emisores
+
+                    const emitterCellPosLocation = solidCellShaderProgram.getAttribLocation('a_cellPosition'); // El nombre del atributo es el mismo
+                    if (emitterCellPosLocation !== -1 && emitterCellPosLocation !== undefined) {
+                        emitterDrawState.vertexAttribPointer(solidCellBuffer, emitterCellPosLocation, 2, wgl.FLOAT, false, 0, 0);
+                    }
+
+                    // Habilitar blending para que el alfa del color del emisor funcione
+                    emitterDrawState.enable(wgl.BLEND);
+                    emitterDrawState.blendFunc(wgl.SRC_ALPHA, wgl.ONE_MINUS_SRC_ALPHA);
+
+                    wgl.drawArrays(emitterDrawState, wgl.TRIANGLES, 0, emitterCellDataArray.length / 2);
+                }
+                // --- ***** FIN NUEVO: DIBUJAR CELDAS EMISORAS ***** ---
+
+            // --- PASO 5: DIBUJAR PARTÍCULAS (si hay alguna) ---
+            if (numParticles > 0 && particleShaderProgram && particleShaderProgram.program && particleBuffer) {
+                const particleDrawState = wgl.createDrawState()
+                    .useProgram(particleShaderProgram)
+                    .uniformMatrix4fv('u_projectionMatrix', false, projectionMatrix)
+                    .uniform1f('u_pointSize', 2.0)
+                    .uniform1f('u_particleAlpha', 1); // Alfa para blending
+
+                // Habilitar y configurar blending para partículas
+                particleDrawState.enable(wgl.BLEND);
+                particleDrawState.blendFunc(wgl.SRC_ALPHA, wgl.ONE_MINUS_SRC_ALPHA);
+
+                const stride = 4 * Float32Array.BYTES_PER_ELEMENT;
+                const posLocation = particleShaderProgram.getAttribLocation('a_particlePosition');
+                const velLocation = particleShaderProgram.getAttribLocation('a_particleVelocity');
+
+                if (posLocation !== -1 && posLocation !== undefined) {
+                    particleDrawState.vertexAttribPointer(particleBuffer, posLocation, 2, wgl.FLOAT, false, stride, 0);
+                }
+                if (velLocation !== -1 && velLocation !== undefined) {
+                    particleDrawState.vertexAttribPointer(particleBuffer, velLocation, 2, wgl.FLOAT, false, stride, 2 * Float32Array.BYTES_PER_ELEMENT);
+                }
+                wgl.drawArrays(particleDrawState, wgl.POINTS, 0, numParticles);
+            }
+        }
+        
+        // --- Las funciones drawHeightGraph y drawPressureIterationsGraph PERMANECEN IGUAL (usan Canvas 2D) ---
+        
+        function drawHeightGraph() {
+            if (!simulator || !graphCtx) return;
+            const data = simulator.getMaxHeightHistory();
+            const totalSimTime = simulator.simulationTime;
+            graphCtx.clearRect(0, 0, graphCanvas.width, graphCanvas.height);
+            graphCtx.strokeStyle = 'black';
+            graphCtx.lineWidth = 1;
+            const minYValue = 0; 
+            const maxYValue = simulator.getDomainHeightMeters();
+            const yPadding = (maxYValue - minYValue) * 0.05; 
+            const graphMinYDisplay = 0; 
+            const graphMaxYDisplay = maxYValue + yPadding;
+            const logStartTime = Math.log(1 + 0); 
+            const logEndTime = (totalSimTime > 0) ? Math.log(1 + totalSimTime) : Math.log(1 + 1); 
+            const logTimeRange = logEndTime - logStartTime;
+            graphCtx.beginPath();
+            graphCtx.moveTo(0, graphCanvas.height); 
+            graphCtx.lineTo(graphCanvas.width, graphCanvas.height);
+            graphCtx.strokeStyle = 'grey'; 
+            graphCtx.stroke();
+            if (data.length < 2) return; 
+            graphCtx.strokeStyle = 'green';
+            graphCtx.lineWidth = 2;
+            graphCtx.beginPath();
+            let firstPoint = true;
+            for (const point of data) {
+                const pointLogTime = Math.log(1 + point.time);
+                let xNorm;
+                if (logTimeRange <= 0) { 
+                    xNorm = 0; 
+                } else {
+                    xNorm = (pointLogTime - logStartTime) / logTimeRange;
+                }
+                const x = xNorm * graphCanvas.width;
+                const yNorm = (point.height - graphMinYDisplay) / (graphMaxYDisplay - graphMinYDisplay);
+                const y = graphCanvas.height * (1 - yNorm); 
+                const clampedY = Math.max(0, Math.min(graphCanvas.height, y));
+                if (firstPoint) {
+                    graphCtx.moveTo(x, clampedY);
+                    firstPoint = false;
+                } else {
+                    graphCtx.lineTo(x, clampedY);
+                }
+            }
+            graphCtx.stroke();
+        }
+        
+        function drawPressureIterationsGraph() {
+            if (!simulator || !iterGraphCtx) return;
+            const data = simulator.getPressureIterationsHistory();
+            const totalSimTime = simulator.simulationTime;
+            iterGraphCtx.clearRect(0, 0, iterGraphCanvas.width, iterGraphCanvas.height);
+            iterGraphCtx.strokeStyle = 'black';
+            iterGraphCtx.lineWidth = 1;
+            const logStartTime = Math.log(1 + 0); 
+            const logEndTime = (totalSimTime > 0) ? Math.log(1 + totalSimTime) : Math.log(1 + 1);
+            const logTimeRange = logEndTime - logStartTime;
+            const minYValue = 0;
+            const maxYValue = simulator.numPressureIterations; 
+            const yPadding = maxYValue * 0.1 || 5; 
+            const graphMinYDisplay = 0;
+            const graphMaxYDisplay = maxYValue + yPadding;
+            iterGraphCtx.beginPath();
+            iterGraphCtx.moveTo(0, iterGraphCanvas.height); 
+            iterGraphCtx.lineTo(iterGraphCanvas.width, iterGraphCanvas.height);
+            iterGraphCtx.strokeStyle = 'grey';
+            iterGraphCtx.stroke();
+            if (graphMaxYDisplay > graphMinYDisplay) { 
+                const yMaxIterNorm = (maxYValue - graphMinYDisplay) / (graphMaxYDisplay - graphMinYDisplay);
+                const yMaxIterPixel = iterGraphCanvas.height * (1 - yMaxIterNorm);
+                iterGraphCtx.beginPath();
+                iterGraphCtx.strokeStyle = 'rgba(255, 0, 0, 0.3)'; 
+                iterGraphCtx.setLineDash([5, 5]);
+                iterGraphCtx.moveTo(0, yMaxIterPixel);
+                iterGraphCtx.lineTo(iterGraphCanvas.width, yMaxIterPixel);
+                iterGraphCtx.stroke();
+                iterGraphCtx.setLineDash([]);
+            }
+            if (data.length < 1) return; 
+            iterGraphCtx.strokeStyle = 'purple'; 
+            iterGraphCtx.lineWidth = 2;
+            iterGraphCtx.beginPath();
+            let firstPoint = true;
+            for (const point of data) {
+                const pointLogTime = Math.log(1 + point.time);
+                let xNorm;
+                if (logTimeRange <= 1e-6) { 
+                    xNorm = (data.length === 1) ? 0.5 : ((pointLogTime - logStartTime) / (1e-6)); 
+                    xNorm = Math.max(0, Math.min(1, xNorm)); 
+                } else {
+                    xNorm = (pointLogTime - logStartTime) / logTimeRange;
+                }
+                const x = xNorm * iterGraphCanvas.width;
+                let yNorm = 0;
+                if (graphMaxYDisplay > graphMinYDisplay) { 
+                    yNorm = (point.iterations - graphMinYDisplay) / (graphMaxYDisplay - graphMinYDisplay);
+                }
+                const y = iterGraphCanvas.height * (1 - yNorm); 
+                const clampedY = Math.max(0, Math.min(iterGraphCanvas.height, y));
+                if (firstPoint) {
+                    // Corregido: iterGraphCtx.moveTo(x, clampedY);
+                    iterGraphCtx.moveTo(x, clampedY); 
+                    firstPoint = false;
+                } else {
+                    iterGraphCtx.lineTo(x, clampedY);
+                }
+            }
+            iterGraphCtx.stroke();
+        }
+
+        function gameLoop(currentTimestamp) {
+            //if (!isRunning || !simulator) return;
+            if (!simulator) {
+                    if (isRunning) {
+                        isRunning = false; // Detener si el simulador desaparece
+                        document.getElementById('startButton').textContent = "Iniciar";
+                    }
+                    if (animationFrameId) cancelAnimationFrame(animationFrameId);
+                    return;
+                }
+
+            // --- CÁLCULO DE FPS ---
+            if (!previousFrameTimestamp) { // Inicializar en el primer frame después de (re)iniciar
+                previousFrameTimestamp = currentTimestamp;
+            }
+            // deltaTime en segundos desde el último frame RENDERIZADO
+            const deltaTimeRender = (currentTimestamp - previousFrameTimestamp) / 1000.0; 
+            previousFrameTimestamp = currentTimestamp;
+
+            frameCountForFPS++;
+            timeAccumulatorForFPS += deltaTimeRender;
+
+            if (timeAccumulatorForFPS >= fpsUpdateInterval) {
+                const fps = frameCountForFPS / timeAccumulatorForFPS;
+                document.getElementById('fpsDisplay').textContent = fps.toFixed(1);
+                frameCountForFPS = 0;
+                timeAccumulatorForFPS = 0.0; // Resetear acumulador
+            }
+            // --- FIN CÁLCULO DE FPS ---
+
+            const actualDt = parseFloat(document.getElementById('dtInput').value) || 0.016;
+            simulator.numPressureIterations = parseInt(document.getElementById('iterInput').value) || 400;
+            
+            //simulator.step(actualDt);
+            if (isRunning) { // Si la simulación principal está corriendo
+                simulator.step(actualDt);
+                    // Procesar emisores aquí, ya que están ligados al avance de la simulación
+                    processActiveParticleSources(); 
+                    processUIEmitters(); // <<-- AÑADIR LLAMADA AQUÍ
+                    //theoreticalParticleCount += 4; // Añadir 4 partículas teóricas
+                    //theoreticalParticleCountHistoryData.push({ time: simulator.simulationTime, count: theoreticalParticleCount });
+
+                    document.getElementById('simTimeDisplay').textContent = simulator.simulationTime.toFixed(2);
+                } else if (simulator) {
+                    // Si la simulación está pausada, podrías decidir si los emisores siguen activos.
+                    // Si llamas a processActiveParticleSources() aquí, añadirían partículas incluso en pausa.
+                    // Por ahora, la dejaremos solo cuando isRunning es true para que se sincronicen con los pasos.
+                    // Si quieres que funcionen en pausa, descomenta la siguiente línea:
+                    // processActiveParticleSources();
+                }
+
+            if (simulator) { // Solo dibujar si hay simulador
+                drawSceneWebGL();
+                drawPressureIterationsGraph();
+                drawHeightGraph();
+                drawParticleCountGraph(); // NUEVA LLAMADA
+
+            }
+            // --- MOSTRAR TIEMPO DE SIMULACIÓN ---
+            // simulator.simulationTime es acumulado dentro de simulator.step()
+            document.getElementById('simTimeDisplay').textContent = simulator.simulationTime.toFixed(2);
+            // --- FIN MOSTRAR TIEMPO DE SIMULACIÓN ---
+
+            drawSceneWebGL(); // <--- MODIFICADO: Llamar a la nueva función de dibujado WebGL
+            
+            // Los gráficos siguen usando Canvas 2D
+            //drawHeightGraph(); 
+            drawPressureIterationsGraph();
+
+            /*
+            if (isRunning && simulator) { // Asegurarse que simulator existe
+                theoreticalParticleCount += 4; 
+                theoreticalParticleCountHistoryData.push({ time: simulator.simulationTime, count: theoreticalParticleCount });
+            }
+            */
+
+            //animationFrameId = requestAnimationFrame(gameLoop);
+            if (isRunning) { // Solo seguir el bucle si la simulación está activa
+                animationFrameId = requestAnimationFrame(gameLoop);
+            }
+        }
+
+        if (webglCanvas) { // Asegurarse de que el canvas existe
+                webglCanvas.addEventListener('mousedown', function(event) {
+                    if (!simulator) return; 
+
+                        if (event.ctrlKey) { // Ctrl para SÓLIDOS
+                            isPaintingSolids = true;
+                            isAddingParticles = false;
+                            isManagingEmitters = false;
+                            if (particleAddIntervalId) { clearInterval(particleAddIntervalId); particleAddIntervalId = null; }
+                            cellsFilledInCurrentStroke.clear();
+                            lastPaintedCell = { i: -1, j: -1 };
+                            const cell = getCellFromMouseEvent(event);
+                            if (cell) {
+                                currentPaintMode = simulator.grid.isSolid[cell.i][cell.j] ? 'erase' : 'paint';
+                                applyPaintToAreaAccordingToMode(cell.i, cell.j);
+                                lastPaintedCell = cell;
+                            }
+                        } else if (event.shiftKey) { // Shift para EMISORES
+                            isManagingEmitters = true;
+                            isPaintingSolids = false;
+                            isAddingParticles = false;
+                            if (particleAddIntervalId) { clearInterval(particleAddIntervalId); particleAddIntervalId = null; }
+                            // cellsFilledInCurrentStroke.clear(); // Emitters no usan este set por ahora, toggle es por celda
+                            lastPaintedCell = { i: -1, j: -1 }; // Usaremos lastPaintedCell para la línea de emisores
+
+                            const cell = getCellFromMouseEvent(event);
+                            if (cell) {
+                                currentEmitterToggleMode = simulator.grid.isEmitterCell[cell.i][cell.j] ? 'erase' : 'create';
+                                applyEmitterToggleToArea(cell.i, cell.j); // Nueva función (ver más abajo)
+                                lastPaintedCell = cell;
+                            }
+                    } else { // Sin Control NI Shift: Añadir PARTÍCULAS
+                        isAddingParticles = true;
+                        isPaintingSolids = false;
+                        isManagingEmitters = false;
+                        cellsFilledInCurrentStroke.clear(); // Iniciar un nuevo "trazo" para partículas
+
+                        const cell = getCellFromMouseEvent(event); 
+                        if (cell) {
+                            // Para el primer clic/área, forzamos la adición reseteando el timer 
+                            // para todas las celdas que vayan a ser afectadas por el pincel.
+                            // Esto se maneja mejor dentro de attemptAndAddParticlesUI si isPartOfActiveStroke es true
+                            // O podemos resetear el timer para la celda central aquí.
+                            // Por ahora, la lógica de `attemptAndAddParticlesUI` con `isPartOfActiveStroke=true` debería ser "instantánea"
+                            // para las celdas nuevas del pincel.
+                            // El `false` en isPartOfActiveStroke para el primer clic en mousedown,
+                            // y luego `true` para las líneas, es la clave.
+
+                            // El primer "toque" del pincel en mousedown.
+                            // Todas las celdas en esta área inicial del pincel se consideran "nuevas" para este trazo.
+                            addParticlesInBrushAreaUI(cell.i, cell.j, true); // true: es parte del inicio del trazo activo
+                                                                        // Esto llamará a attemptAndAddParticlesUI con isPartOfActiveStroke=true
+                                                                        // para cada celda en el área del pincel.
+
+                            lastProcessedCellForParticleLine = cell; // El centro del pincel es el inicio de la línea
+
+                            if (particleAddIntervalId) clearInterval(particleAddIntervalId);
+                            particleAddIntervalId = setInterval(() => {
+                                if (isAddingParticles && simulator && lastProcessedCellForParticleLine.i !== -1) {
+                                    // "Mantener pulsado" aplica el pincel en el área de la última celda,
+                                    // y cada celda dentro de ese pincel se evaluará con el timer.
+                                    addParticlesInBrushAreaUI(lastProcessedCellForParticleLine.i, lastProcessedCellForParticleLine.j, false);
+                                }
+                            }, PARTICLE_ADD_INTERVAL_MS);
+                        }
+                    }
+                });
+
+                webglCanvas.addEventListener('mousemove', function(event) {
+                    if (!simulator) return;
+
+                    const currentCell = getCellFromMouseEvent(event); 
+                    if (!currentCell) {
+                        lastPaintedCell = { i: -1, j: -1 };
+                        lastProcessedCellForParticleLine = { i: -1, j: -1 }; 
+                        return;
+                    }
+
+                    if (event.ctrlKey && isPaintingSolids) { // Modo SÓLIDOS (Ctrl + Arrastre)
+                        if (lastPaintedCell.i !== -1 && // Si hay una celda previa válida
+                            (lastPaintedCell.i !== currentCell.i || lastPaintedCell.j !== currentCell.j)) { // Y la celda ha cambiado
+                            drawLineBetweenCellsAccordingToMode(lastPaintedCell.i, lastPaintedCell.j, currentCell.i, currentCell.j);
+                        } else if (lastPaintedCell.i === -1 && isPaintingSolids) {
+                            // Caso borde: El mousedown no estaba sobre una celda válida pero el arrastre sí.
+                            // Se pinta la celda actual.
+                            applyPaintToAreaAccordingToMode(currentCell.i, currentCell.j);
+                        }
+                        lastPaintedCell = currentCell; // Actualizar la última celda pintada para sólidos
+
+                    } else if (event.shiftKey && isManagingEmitters) { // Modo EMISORES (Shift + Arrastre)
+                        if (lastPaintedCell.i !== -1 && // Si hay una celda previa válida
+                            (lastPaintedCell.i !== currentCell.i || lastPaintedCell.j !== currentCell.j)) { // Y la celda ha cambiado
+                            drawLineAndToggleEmitters(lastPaintedCell.i, lastPaintedCell.j, currentCell.i, currentCell.j);
+                        } else if (lastPaintedCell.i === -1 && isManagingEmitters) {
+                            // Caso borde para emisores.
+                            applyEmitterToggleToArea(currentCell.i, currentCell.j);
+                        }
+                        lastPaintedCell = currentCell; // Reutilizamos lastPaintedCell para la línea de emisores
+
+                    } else if (!event.ctrlKey && !event.shiftKey && isAddingParticles) { // Modo PARTÍCULAS (Arrastre normal)
+                        if (lastProcessedCellForParticleLine.i !== -1 && // Si hay una celda previa válida
+                            (lastProcessedCellForParticleLine.i !== currentCell.i || lastProcessedCellForParticleLine.j !== currentCell.j)) { // Y la celda ha cambiado
+                            // Dibujar la línea de partículas. Cada celda en la línea se procesará con isPartOfActiveStroke = true
+                            drawLineAndAddParticles_strokeBased(lastProcessedCellForParticleLine.i, lastProcessedCellForParticleLine.j, currentCell.i, currentCell.j);
+                        }
+                        // else if (lastProcessedCellForParticleLine.i === -1 && isAddingParticles) {
+                            // Este caso (primer punto de un arrastre que empezó fuera) lo maneja mousedown o el primer intento de línea.
+                            // La primera celda (del mousedown) ya fue procesada con isPartOfActiveStroke = false (o timer reseteado).
+                            // El setInterval se encarga de la adición si el ratón se queda quieto sobre ella.
+                        // }
+
+                        // Siempre actualizar la última celda procesada para que el setInterval sepa dónde actuar
+                        // y para el siguiente segmento de línea si el arrastre continúa.
+                        lastProcessedCellForParticleLine = currentCell;
+                    }
+
+                });
+
+                webglCanvas.addEventListener('mouseup', function(event) {
+                    if (particleAddIntervalId) { // Detener el intervalo de "mantener pulsado"
+                        clearInterval(particleAddIntervalId);
+                        particleAddIntervalId = null;
+                    }
+                    isPaintingSolids = false;
+                    isAddingParticles = false; 
+                    isManagingEmitters = false; // NUEVO
+                    lastPaintedCell = { i: -1, j: -1 };
+                    lastProcessedCellForParticleLine = { i: -1, j: -1 }; 
+                });
+
+                webglCanvas.addEventListener('mouseleave', function(event) {
+                    // Si el botón sigue presionado al salir (isAddingParticles es true), el intervalo se detiene
+                    // para no seguir añadiendo si el ratón no está sobre el canvas.
+                    // Si se quiere que continúe si el botón sigue pulsado y vuelve a entrar, el mousedown/mousemove lo reactivaría.
+                        if (isPaintingSolids || isAddingParticles || isManagingEmitters) {
+                            isPaintingSolids = false;
+                            isAddingParticles = false;
+                            isManagingEmitters = false; // NUEVO
+                        }
+
+                    // No necesariamente resetear isAddingParticles aquí si el botón podría seguir presionado.
+                    // Pero sí resetear lastProcessedCell... para que una re-entrada no trace una línea desde fuera.
+                    lastPaintedCell = { i: -1, j: -1 }; 
+                    lastProcessedCellForParticleLine = { i: -1, j: -1 };
+                });
+
+            }
+
+        document.getElementById('startButton').addEventListener('click', () => {
+            if (!simulator) { // Si el simulador (y wgl) no está configurado, hacerlo.
+                 setupSimulator();
+            }
+            if (!wgl || !wgl.gl) return; // Salir si WebGL falló en setup
+
+            isRunning = !isRunning;
+            if (isRunning) {
+                //lastTime = 0; 
+                // Capturar el estado actual como el "estado inicial" para el reseteo suave
+                // Usamos JSON.parse(JSON.stringify(...)) para una copia profunda de arrays simples
+                initialSolidGridState = JSON.parse(JSON.stringify(simulator.grid.isSolid));
+                initialEmitterGridState = JSON.parse(JSON.stringify(simulator.grid.isEmitterCell));
+                initialParticlesState = JSON.parse(JSON.stringify(simulator.particles));
+                // Si tienes 'activeParticleSources' que se pueden configurar interactivamente antes del 'run',
+                // también deberías guardarlos aquí. Los que se añaden en setupSimulator() no necesitan guardarse aquí.
+
+                isRunning = true;
+                previousFrameTimestamp = 0; // Resetear para cálculo de FPS
+                frameCountForFPS = 0;
+                timeAccumulatorForFPS = 0.0;
+                // No resetear simulator.simulationTime aquí si queremos que continúe
+                // Pero para un "inicio" real, el tiempo debería ser 0 (lo manejaremos en el soft reset)
+
+                //
+                animationFrameId = requestAnimationFrame(gameLoop);
+                document.getElementById('startButton').textContent = "Pausar";
+            } else {
+                isRunning = false;
+                cancelAnimationFrame(animationFrameId);
+                if (particleAddIntervalId) { 
+                    clearInterval(particleAddIntervalId);
+                    particleAddIntervalId = null;
+                }
+                document.getElementById('startButton').textContent = "Iniciar";
+                    }
+        });
+        
+        document.getElementById('resetButton').addEventListener('click', () => {
+            console.log("Realizando reseteo total (Hard Reset)...");
+            if (isRunning) {
+                cancelAnimationFrame(animationFrameId);
+                isRunning = false;
+                document.getElementById('startButton').textContent = "Iniciar";
+            }
+            if (particleAddIntervalId) {
+                clearInterval(particleAddIntervalId);
+                particleAddIntervalId = null;
+            }
+
+            // Limpiar el estado guardado para el reseteo suave
+            initialSolidGridState = null;
+            initialEmitterGridState = null;
+            initialParticlesState = null;
+
+            setupSimulator(); // Llama a la configuración completa desde cero
+        });
+
+        document.getElementById('softResetButton').addEventListener('click', () => {
+            if (!simulator) {
+                console.log("Simulador no inicializado. Realizando configuración completa.");
+                setupSimulator();
+                return;
+            }
+
+            if (initialSolidGridState === null || initialEmitterGridState === null || initialParticlesState === null) {
+                console.log("No hay estado inicial configurado guardado. Realizando reseteo total en su lugar.");
+                // Opcional: podrías directamente llamar a setupSimulator() si no hay estado guardado,
+                // o simplemente no hacer nada y que el usuario inicie y guarde un estado primero.
+                // Por ahora, llamaremos a setupSimulator() como fallback.
+                document.getElementById('resetButton').click(); // Simula un clic en el botón de reseteo total
+                return;
+            }
+
+            console.log("Realizando reseteo suave (Volviendo al inicio configurado)...");
+
+            // Detener la simulación si está corriendo
+            if (isRunning) {
+                cancelAnimationFrame(animationFrameId);
+                isRunning = false;
+                document.getElementById('startButton').textContent = "Iniciar";
+            }
+            if (particleAddIntervalId) {
+                clearInterval(particleAddIntervalId);
+                particleAddIntervalId = null;
+            }
+
+            // 1. Resetear tiempo de simulación
+            simulator.simulationTime = 0.0;
+
+            // 2. Restaurar rejillas de sólidos y emisores de UI
+            simulator.grid.isSolid = JSON.parse(JSON.stringify(initialSolidGridState));
+            simulator.grid.isEmitterCell = JSON.parse(JSON.stringify(initialEmitterGridState));
+
+            // 3. Limpiar datos dinámicos de la rejilla (velocidades, presión, fluidos, densidad, conteo)
+            // La forma más robusta es tener un método en MACGrid o FLIPSimulator para esto,
+            // pero por ahora lo haremos explícito:
+            const nx = simulator.grid.nx;
+            const ny = simulator.grid.ny;
+            simulator.grid.u = Array(nx + 1).fill(null).map(() => Array(ny).fill(0.0));
+            simulator.grid.v = Array(nx).fill(null).map(() => Array(ny + 1).fill(0.0));
+            simulator.grid.p = Array(nx).fill(null).map(() => Array(ny).fill(0.0));
+            simulator.grid.isFluid = Array(nx).fill(null).map(() => Array(ny).fill(0));
+            simulator.grid.cellDensity = Array(nx).fill(null).map(() => Array(ny).fill(0.0));
+            simulator.grid.particleCountPerCell = Array(nx).fill(null).map(() => Array(ny).fill(0));
+            simulator.grid.u_before_pressure = Array(nx + 1).fill(null).map(() => Array(ny).fill(0.0));
+            simulator.grid.v_before_pressure = Array(nx).fill(null).map(() => Array(ny + 1).fill(0.0));
+
+            // 4. Restaurar partículas
+            simulator.particles = JSON.parse(JSON.stringify(initialParticlesState));
+
+            // 5. Resetear datos de los gráficos
+            simulator.maxHeightData = [];
+            simulator.pressureIterationsData = [];
+            simulator.particleCountHistoryData = [];
+            // theoreticalParticleCount = 0; // Si todavía usas esto para el gráfico
+            // theoreticalParticleCountHistoryData = [{ time: 0, count: 0 }];
+
+            // 6. Resetear estados de la UI para pintura/adición
+            isPaintingSolids = false;
+            lastPaintedCell = { i: -1, j: -1 };
+            currentPaintMode = 'paint';
+            // brushSize se lee del input, no es necesario resetear la variable global aquí si el input es la fuente.
+            // brushSize = parseInt(document.getElementById('brushSizeInput').value) || 1;
+            isAddingParticles = false;
+            lastProcessedCellForParticleLine = { i: -1, j: -1 };
+            cellParticleAddTimestamps.clear();
+            // uiEmitterLastAddTime.clear(); // Los emisores de UI se restauran con grid.isEmitterCell
+                                        // y sus timestamps se gestionarán en processUIEmitters.
+                                        // Es mejor limpiar uiEmitterLastAddTime para que empiecen "frescos".
+            uiEmitterLastAddTime.clear();
+
+
+            // 7. Resetear emisores programados (activeParticleSources)
+            // Si los emisores programados son parte de la configuración inicial (añadidos en setupSimulator),
+            // y setupSimulator NO se llama en un soft reset, entonces necesitarías una forma de
+            // reactivarlos o guardarlos/restaurarlos también.
+            // Por ahora, asumimos que los emisores de UI son los principales para el estado guardado.
+            // Si quieres que los emisores programados en setupSimulator se reactiven,
+            // tendrías que volver a ejecutar la parte de setupSimulator que los añade,
+            // o guardar/restaurar 'activeParticleSources' si se pueden añadir interactivamente.
+            // Para este reseteo, limpiemos 'activeParticleSources' si solo se añaden en setupSimulator (hard reset).
+            // O, si el "estado inicial capturado" es POST setupSimulator y ANTES de run, entonces 'activeParticleSources'
+            // ya estarían como queremos en ese momento. La captura que hicimos en 'startButton' no incluye 'activeParticleSources'.
+            // Vamos a asumir que si hay 'activeParticleSources' hardcodeados en setupSimulator, el soft reset no los recrea.
+            // Si se pueden añadir/quitar interactivamente, habría que guardarlos.
+            // Por ahora, los emisores de UI (grid.isEmitterCell) son los que se restauran.
+
+            // 8. Actualizar Visualización
+            document.getElementById('simTimeDisplay').textContent = simulator.simulationTime.toFixed(2);
+            document.getElementById('fpsDisplay').textContent = "--";
+            previousFrameTimestamp = 0; 
+
+            drawSceneWebGL();
+            drawHeightGraph(); 
+            drawPressureIterationsGraph();
+            drawParticleCountGraph();
+
+            console.log("Reseteo suave completado.");
+        });
+
+        document.addEventListener('DOMContentLoaded', () => {
+            setupSimulator();
+        });
+    </script>
+</body>
+</html>
